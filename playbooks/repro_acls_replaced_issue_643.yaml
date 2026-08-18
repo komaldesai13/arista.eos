@@ -1,0 +1,119 @@
+---
+# Reproducer for https://github.com/ansible-collections/arista.eos/issues/643
+#
+# Bug: eos_acls state:replaced puts ACEs under the wrong ACL context when
+# a new ACL (alphabetically first) is added alongside changes to an existing ACL.
+#
+# The flat command dedup in _state_replaced drops the second "ip access-list existing-acl"
+# header, so the ACEs for existing-acl fall under aaa-new-acl instead.
+#
+# Usage:
+#   ansible-playbook playbooks/repro_acls_replaced_issue_643.yaml -i inventory.yaml
+#
+# The play uses check_mode for the replaced task so you can inspect the generated
+# commands without applying them. Look at the "result.commands" output — if the bug
+# is present, "10 deny ip any any" will appear under "aaa-new-acl" instead of
+# "existing-acl".
+
+- name: "Reproduce issue #643 — eos_acls replaced wrong ACL context"
+  hosts: eos
+  gather_facts: false
+  connection: ansible.netcommon.network_cli
+
+  tasks:
+    # Step 1: Seed the device with a single ACL ("existing-acl")
+    - name: Seed device with existing-acl
+      arista.eos.eos_acls:
+        config:
+          - afi: ipv4
+            acls:
+              - name: existing-acl
+                aces:
+                  - sequence: 10
+                    grant: permit
+                    protocol: ip
+                    source:
+                      subnet_address: 1.2.3.0/24
+                    destination:
+                      any: true
+        state: merged
+
+    # Step 2: Run state:replaced with two ACLs:
+    #   - "aaa-new-acl"  (alphabetically BEFORE "existing-acl", does NOT exist on device)
+    #   - "existing-acl" (already on device, ACE changed from permit -> deny)
+    #
+    # Expected commands (fixed):
+    #   ip access-list existing-acl
+    #   no 10
+    #   10 deny ip any any
+    #   ip access-list aaa-new-acl
+    #   10 permit ip any any
+    #
+    # Buggy commands (before fix):
+    #   ip access-list existing-acl
+    #   no 10
+    #   ip access-list aaa-new-acl
+    #   10 permit ip any any
+    #   10 deny ip any any             <-- WRONG: lands under aaa-new-acl
+    - name: "Replace with aaa-new-acl + modified existing-acl (check_mode)"
+      arista.eos.eos_acls:
+        config:
+          - afi: ipv4
+            acls:
+              - name: aaa-new-acl
+                aces:
+                  - sequence: 10
+                    grant: permit
+                    protocol: ip
+                    source:
+                      any: true
+                    destination:
+                      any: true
+              - name: existing-acl
+                aces:
+                  - sequence: 10
+                    grant: deny
+                    protocol: ip
+                    source:
+                      any: true
+                    destination:
+                      any: true
+        state: replaced
+      check_mode: true
+      register: result
+
+    - name: Show generated commands
+      ansible.builtin.debug:
+        var: result.commands
+
+    # Step 3: Validate that each ACE is under the correct ACL header.
+    # The deny ACE for existing-acl must appear BEFORE the aaa-new-acl header,
+    # and the permit ACE must appear AFTER it.
+    - name: Validate command ordering
+      vars:
+        deny_idx: "{{ result.commands.index('10 deny ip any any') }}"
+        permit_idx: "{{ result.commands.index('10 permit ip any any') }}"
+        existing_hdr_idx: "{{ result.commands.index('ip access-list existing-acl') }}"
+        new_hdr_idx: "{{ result.commands.index('ip access-list aaa-new-acl') }}"
+      ansible.builtin.assert:
+        that:
+          - result.commands | length > 0
+          - existing_hdr_idx | int < deny_idx | int
+          - deny_idx | int < new_hdr_idx | int
+          - new_hdr_idx | int < permit_idx | int
+        fail_msg: >-
+          BUG CONFIRMED (issue #643): ACEs are not under the correct ACL headers.
+          Generated commands: {{ result.commands }}
+        success_msg: >-
+          Bug is fixed: each ACE is correctly placed under its own ACL header.
+
+    # Step 4: Clean up the seed ACL
+    - name: Clean up
+      arista.eos.eos_acls:
+        config:
+          - afi: ipv4
+            acls:
+              - name: existing-acl
+              - name: aaa-new-acl
+        state: deleted
+      ignore_errors: true
