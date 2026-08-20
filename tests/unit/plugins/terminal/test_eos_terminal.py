@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import re
+
 from unittest.mock import MagicMock
 
 import pytest
@@ -70,9 +71,9 @@ class TestOnBecomePromptRegex:
     )
     def test_password_prompt_matches(self, terminal, prompt_text, description):
         regex = self._extract_prompt_regex(terminal)
-        assert regex.search(prompt_text), (
-            f"Prompt regex should match '{prompt_text!r}' ({description})"
-        )
+        assert regex.search(
+            prompt_text
+        ), f"Prompt regex should match '{prompt_text!r}' ({description})"
 
     @pytest.mark.parametrize(
         "prompt_text",
